@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
-from mariadb_writer import MariaDBWriter
+from RasPi_Sensors.mariadb_writer import MariaDBWriter
 
 try:
     import board
@@ -60,7 +60,7 @@ try:
 except ImportError:
     HAS_MUX = False
 
-from calibration import CalibrationManager
+from RasPi_Sensors.calibration import CalibrationManager
 
 
 # ==============================================================================
