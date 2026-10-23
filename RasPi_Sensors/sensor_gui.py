@@ -232,7 +232,7 @@ def load_channels():
 PIN_MAP = {0: 1, 1: 2, 2: 3, 3: 0}
 ADS_PINS = None
 if HAS_ADC:
-    ADS_PINS = {0: ADS.P0, 1: ADS.P1, 2: ADS.P2, 3: ADS.P3}
+    ADS_PINS = {0: 0, 1: 1, 2: 2, 3: 3}
 
 
 def init_adcs(sensor_channels, mux_address=DEFAULT_MUX_ADDRESS):
