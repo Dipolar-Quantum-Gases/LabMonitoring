@@ -9,6 +9,7 @@ Features:
     - Tabs: Live Readings, Channel Config, Calibration, Settings
     - Multi-board ADS1115 support (direct + TCA9548A multiplexer)
     - Auto-scan: detect new boards on the I2C bus and add them to the config
+    - Debug console: environment, I2C bus, ADC board, and input diagnostics
     - Status thresholds: per-sensor raw/calibrated min/max with live alert display
     - ×3 voltage divider correction (matches pi_sensor_reader.py)
 
@@ -32,6 +33,9 @@ import os
 import re
 import sys
 import csv
+import math
+import platform
+import traceback
 from datetime import datetime, timezone
 
 import yaml
@@ -42,22 +46,24 @@ from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 from mariadb_writer import MariaDBWriter
 
-# try:
-#     import board
-#     import busio
-#     import adafruit_ads1x15.ads1115 as ADS
-#     from adafruit_ads1x15.analog_in import AnalogIn
-#     HAS_ADC = True
-# except ImportError:
-#     HAS_ADC = False
-# 
-# try:
-#     import adafruit_tca9548a
-#     HAS_MUX = True
-# except ImportError:
-#     HAS_MUX = False
-HAS_ADC = False
-HAS_MUX = False
+try:
+    import board
+    import busio
+    import adafruit_ads1x15.ads1115 as ADS
+    from adafruit_ads1x15.analog_in import AnalogIn
+    HAS_ADC = True
+    ADC_IMPORT_ERROR = None
+except Exception as exc:
+    HAS_ADC = False
+    ADC_IMPORT_ERROR = str(exc)
+
+try:
+    import adafruit_tca9548a
+    HAS_MUX = True
+    MUX_IMPORT_ERROR = None
+except ImportError as exc:
+    HAS_MUX = False
+    MUX_IMPORT_ERROR = str(exc)
 
 # ==============================================================================
 # CONFIG
@@ -301,6 +307,277 @@ def read_adc(adcs, channel_config):
         return None
 
 
+def run_hardware_diagnostics(sensor_channels, mux_address, hardware_busy=False):
+    """Return a detailed report about the configured ADC hardware."""
+    report = [
+        "=" * 72,
+        "LAB MONITORING HARDWARE DIAGNOSTICS",
+        f"Time: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"Host: {platform.node() or 'unknown'}",
+        f"Platform: {platform.platform()}",
+        f"Python: {sys.version.replace(os.linesep, ' ')}",
+        f"Application: {os.path.abspath(__file__)}",
+        f"Working directory: {os.getcwd()}",
+        f"Sensor config: {CONFIG_FILE} ({'found' if os.path.isfile(CONFIG_FILE) else 'missing'})",
+        f"Enabled channels: {sum(1 for cfg in sensor_channels.values() if cfg.get('enabled'))}",
+        f"Configured channels: {len(sensor_channels)}",
+        f"I2C multiplexer address: 0x{mux_address:02X}",
+        "",
+        "Raspberry Pi I2C pins: SDA1 = BCM GPIO 2 / physical pin 3; "
+        "SCL1 = BCM GPIO 3 / physical pin 5.",
+        "The bus scan checks which I2C devices acknowledge; it cannot measure "
+        "static pin voltage or prove wiring quality.",
+        "Diagnostics probe the I2C bus and configure ADC gain for sampling; "
+        "they do not set sensor inputs as GPIO outputs.",
+        "ADC input labels use the configured board mapping: "
+        "A0->ADS P1, A1->P2, A2->P3, A3->P0.",
+        "",
+        "Optional hardware libraries:",
+        f"  ADC/I2C libraries: {'available' if HAS_ADC else 'unavailable'}",
+    ]
+    if not HAS_ADC:
+        report.append(f"    Import error: {ADC_IMPORT_ERROR}")
+    report.append(f"  TCA9548A library: {'available' if HAS_MUX else 'unavailable'}")
+    if not HAS_MUX:
+        report.append(f"    Import error: {MUX_IMPORT_ERROR}")
+
+    enabled_channels = {
+        name: cfg for name, cfg in sensor_channels.items() if cfg.get("enabled")
+    }
+    report.append("")
+    report.append("Configured sensor inputs:")
+    if not sensor_channels:
+        report.append("  No valid channels were loaded from the sensor configuration.")
+    else:
+        for name, cfg in sorted(sensor_channels.items()):
+            state = "enabled" if cfg.get("enabled") else "disabled"
+            mux_channel = cfg.get("mux_channel")
+            board_name = (
+                f"MUX{mux_channel}_ADC{cfg['adc_index']}"
+                if mux_channel is not None else f"ADC{cfg['adc_index']}"
+            )
+            report.append(
+                f"  {name} ({cfg.get('label', name)}): {state}; "
+                f"{board_name}; input A{cfg['channel']}; gain {cfg.get('gain', 1)}"
+            )
+
+    if hardware_busy:
+        report.extend([
+            "",
+            "Hardware tests skipped: data collection is running and owns the ADC bus.",
+            "Stop collection and run diagnostics again for live input measurements.",
+        ])
+        return report
+
+    if not HAS_ADC:
+        report.extend([
+            "",
+            "Hardware tests skipped because the ADC/I2C libraries are unavailable.",
+            "Install the project's Adafruit Blinka and ADS1x15 dependencies on the Pi.",
+        ])
+        return report
+
+    report.extend(["", "I2C bus and ADC input tests:"])
+    i2c = None
+    mux = None
+    try:
+        report.append(f"  board.SDA: {board.SDA!r}")
+        report.append(f"  board.SCL: {board.SCL!r}")
+        i2c = busio.I2C(board.SCL, board.SDA)
+        deadline = time.monotonic() + 3.0
+        while not i2c.try_lock():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("I2C bus remained locked for 3 seconds")
+            time.sleep(0.01)
+        try:
+            addresses = i2c.scan()
+        finally:
+            i2c.unlock()
+
+        report.append(
+            "  I2C scan: " + (
+                ", ".join(f"0x{address:02X}" for address in addresses)
+                if addresses else "no devices acknowledged"
+            )
+        )
+        adc_indices_on_bus = [
+            index for index, address in ADC_ADDRESSES.items() if address in addresses
+        ]
+        report.append(
+            "  Direct ADS1115 address candidates: " + (
+                ", ".join(f"ADC{index} (0x{ADC_ADDRESSES[index]:02X})"
+                          for index in adc_indices_on_bus)
+                if adc_indices_on_bus else "none"
+            )
+        )
+
+        needs_mux = any(cfg.get("mux_channel") is not None
+                        for cfg in enabled_channels.values())
+        if needs_mux:
+            if not HAS_MUX:
+                report.append("  Multiplexer test: FAIL — TCA9548A library unavailable")
+            else:
+                try:
+                    mux = adafruit_tca9548a.TCA9548A(i2c, address=mux_address)
+                    report.append(
+                        f"  Multiplexer at 0x{mux_address:02X}: PASS (responded)"
+                    )
+                except Exception as exc:
+                    report.append(
+                        f"  Multiplexer at 0x{mux_address:02X}: FAIL — "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        keys_to_test = {hardware_key(cfg) for cfg in enabled_channels.values()}
+        if not keys_to_test:
+            keys_to_test.update((None, index) for index in adc_indices_on_bus)
+            if not keys_to_test:
+                report.append("  No configured active ADC boards to test.")
+
+        config_by_key_and_channel = {
+            (hardware_key(cfg), cfg["channel"]): (name, cfg)
+            for name, cfg in enabled_channels.items()
+        }
+        gain_full_scale = {
+            2 / 3: 6.144,
+            1: 4.096,
+            2: 2.048,
+            4: 1.024,
+            8: 0.512,
+            16: 0.256,
+        }
+
+        for mux_channel, adc_index in sorted(
+                keys_to_test, key=lambda key: (-1 if key[0] is None else key[0], key[1])):
+            if adc_index not in ADC_ADDRESSES:
+                report.append(
+                    f"  ADC board (mux={mux_channel}, index={adc_index}): "
+                    "FAIL — unsupported ADC address index"
+                )
+                continue
+            address = ADC_ADDRESSES[adc_index]
+            board_label = (
+                f"MUX{mux_channel}_ADC{adc_index}"
+                if mux_channel is not None else f"ADC{adc_index}"
+            )
+            if mux_channel is not None and mux is None:
+                report.append(
+                    f"  {board_label}: FAIL — multiplexer could not be initialized"
+                )
+                continue
+            if mux_channel is None and address not in addresses:
+                report.append(
+                    f"  {board_label} (0x{address:02X}): FAIL — "
+                    "address did not acknowledge on the I2C bus"
+                )
+                continue
+            if mux_channel is not None and not 0 <= mux_channel <= 7:
+                report.append(
+                    f"  {board_label}: FAIL — mux channel must be between 0 and 7"
+                )
+                continue
+
+            try:
+                adc_bus = i2c if mux_channel is None else mux[mux_channel]
+                ads = ADS.ADS1115(adc_bus, address=address)
+                report.append(f"  {board_label} (0x{address:02X}): PASS (initialized)")
+            except Exception as exc:
+                report.append(
+                    f"  {board_label} (0x{address:02X}): FAIL — "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+
+            for channel in range(4):
+                configured = config_by_key_and_channel.get(
+                    ((mux_channel, adc_index), channel)
+                )
+                sensor_name, sensor_cfg = configured if configured else (None, {})
+                gain = sensor_cfg.get("gain", 1)
+                label = (
+                    f"A{channel} ({sensor_name})"
+                    if sensor_name else f"A{channel} (not configured)"
+                )
+                input_pin = PIN_MAP[channel]
+                try:
+                    ads.gain = gain
+                    analog_input = AnalogIn(ads, ADS_PINS[input_pin])
+                    samples = []
+                    for sample_index in range(3):
+                        samples.append(float(analog_input.voltage))
+                        if sample_index < 2:
+                            time.sleep(0.05)
+                    if not all(math.isfinite(value) for value in samples):
+                        raise ValueError(f"non-finite voltage samples: {samples}")
+                except Exception as exc:
+                    report.append(
+                        f"    {label}: FAIL — {type(exc).__name__}: {exc}"
+                    )
+                    continue
+
+                low, high = min(samples), max(samples)
+                delta = high - low
+                sample_text = ", ".join(f"{value:.6f} V" for value in samples)
+                if not sensor_name:
+                    report.append(
+                        f"    {label}: INFO — readable; samples [{sample_text}], "
+                        f"delta {delta:.6f} V; no configured expected range"
+                    )
+                    continue
+
+                issues = []
+                full_scale = gain_full_scale.get(gain)
+                if full_scale is None:
+                    issues.append(f"gain {gain!r} has no known ADS1115 range")
+                elif low < 0 or high > full_scale:
+                    issues.append(
+                        f"outside the +/-{full_scale:.3f} V PGA range"
+                    )
+
+                raw_min = parse_threshold(sensor_cfg.get("raw_min"))
+                raw_max = parse_threshold(sensor_cfg.get("raw_max"))
+                if raw_min is not None and low < raw_min:
+                    issues.append(f"below configured raw_min {raw_min:g} V")
+                if raw_max is not None and high > raw_max:
+                    issues.append(f"above configured raw_max {raw_max:g} V")
+
+                if issues:
+                    status = "WARN — " + "; ".join(issues)
+                elif delta == 0:
+                    status = (
+                        "CAUTION — unchanged across samples; this may be a steady "
+                        "signal or a disconnected/stuck input"
+                    )
+                else:
+                    status = "PASS — readable and within known configured ranges"
+                report.append(
+                    f"    {label}: {status}; samples [{sample_text}], "
+                    f"delta {delta:.6f} V"
+                )
+
+    except Exception as exc:
+        report.append(
+            f"  I2C diagnostic failed: {type(exc).__name__}: {exc}"
+        )
+    finally:
+        if i2c is not None:
+            try:
+                i2c.deinit()
+                report.append("  I2C bus released.")
+            except Exception as exc:
+                report.append(
+                    f"  I2C cleanup failed: {type(exc).__name__}: {exc}"
+                )
+
+    report.extend([
+        "",
+        "Interpretation: a readable value only proves the ADC transaction worked. "
+        "Confirm sensor wiring, supply voltage, and expected signal range separately.",
+        "=" * 72,
+    ])
+    return report
+
+
 def save_to_csv(csv_dir, sensor_name, fields, timestamp):
     os.makedirs(csv_dir, exist_ok=True)
     filename = os.path.join(csv_dir, f"{sensor_name}_{timestamp.strftime('%Y-%m')}.csv")
@@ -449,6 +726,8 @@ class SensorMonitorApp:
         self.influx_client = None
         self.write_api = None
         self.mariadb_writer = None
+        self.debug_window = None
+        self.debug_running = False
 
         self.pending_cal = {}
 
@@ -482,6 +761,10 @@ class SensorMonitorApp:
         self.btn_init_adc = ttk.Button(top_frame, text="Reinit ADC",
                                         command=self._init_adc_safe)
         self.btn_init_adc.pack(side=tk.RIGHT, padx=5)
+
+        self.btn_debug = ttk.Button(top_frame, text="Debug Console",
+                                    command=self._open_debug_console)
+        self.btn_debug.pack(side=tk.RIGHT, padx=5)
 
         # --- Notebook ---
         self.notebook = ttk.Notebook(self.root)
@@ -1243,6 +1526,82 @@ class SensorMonitorApp:
     # DATA COLLECTION
     # ==========================================================================
 
+    def _open_debug_console(self):
+        if self.debug_window is not None and self.debug_window.winfo_exists():
+            self.debug_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.debug_window = window
+        window.title("Sensor Monitor Debug Console")
+        window.geometry("920x620")
+        window.transient(self.root)
+
+        toolbar = ttk.Frame(window, padding=8)
+        toolbar.pack(fill=tk.X)
+        self.debug_run_button = ttk.Button(
+            toolbar, text="Run Diagnostics", command=self._run_debug_diagnostics,
+            state=tk.DISABLED if self.debug_running else tk.NORMAL)
+        self.debug_run_button.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="Close", command=window.destroy).pack(side=tk.RIGHT)
+
+        self.debug_text = scrolledtext.ScrolledText(
+            window, state=tk.DISABLED, font=("Courier", 9), wrap=tk.WORD)
+        self.debug_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self._run_debug_diagnostics()
+
+    def _append_debug_output(self, window, lines):
+        if self.debug_window is not window or not window.winfo_exists():
+            return
+        self.debug_text.configure(state=tk.NORMAL)
+        self.debug_text.insert(tk.END, "\n".join(lines) + "\n")
+        self.debug_text.see(tk.END)
+        self.debug_text.configure(state=tk.DISABLED)
+
+    def _run_debug_diagnostics(self):
+        if self.debug_running:
+            return
+        if self.debug_window is None or not self.debug_window.winfo_exists():
+            return
+
+        self.debug_running = True
+        window = self.debug_window
+        self.debug_text.configure(state=tk.NORMAL)
+        self.debug_text.delete("1.0", tk.END)
+        self.debug_text.insert(tk.END, "Running diagnostics...\n")
+        self.debug_text.configure(state=tk.DISABLED)
+        self.debug_run_button.configure(state=tk.DISABLED, text="Running...")
+        if not self.running:
+            self.btn_start.configure(state=tk.DISABLED)
+
+        channels = {name: dict(cfg) for name, cfg in self.channels.items()}
+        mux_address = self.mux_address
+        hardware_busy = self.running
+
+        def worker():
+            try:
+                report = run_hardware_diagnostics(
+                    channels, mux_address, hardware_busy=hardware_busy)
+            except Exception as exc:
+                report = [
+                    f"Diagnostics failed unexpectedly: {type(exc).__name__}: {exc}",
+                    traceback.format_exc(),
+                ]
+            try:
+                self.root.after(0, self._debug_diagnostics_done, window, report)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _debug_diagnostics_done(self, window, report):
+        self.debug_running = False
+        if self.debug_window is not None and self.debug_window.winfo_exists():
+            self.debug_run_button.configure(state=tk.NORMAL, text="Run Diagnostics")
+        if not self.running:
+            self.btn_start.configure(state=tk.NORMAL)
+        self._append_debug_output(window, report)
+
     def _init_adc_safe(self):
         try:
             self.adcs, self.mux = init_adcs(self.channels, mux_address=self.mux_address)
@@ -1259,7 +1618,7 @@ class SensorMonitorApp:
             self.log(f"ADC init error: {e}")
 
     def start_collection(self):
-        if self.running:
+        if self.running or self.debug_running:
             return
 
         backend = self.settings.get("database_backend", DEFAULT_DATABASE_BACKEND).lower()
@@ -1455,4 +1814,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
